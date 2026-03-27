@@ -1,12 +1,13 @@
 import base64
 import imghdr
+import json
 import logging
 import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -43,7 +44,7 @@ HTML_TEMPLATE = """<!doctype html>
       padding: 24px;
     }
     main {
-      width: min(960px, 100%);
+      width: min(1080px, 100%);
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 24px;
@@ -93,7 +94,7 @@ HTML_TEMPLATE = """<!doctype html>
     }
     .meta {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 12px;
       margin-top: 18px;
     }
@@ -121,7 +122,7 @@ HTML_TEMPLATE = """<!doctype html>
   <main>
     <header>
       <h1>Latest X-Road Image</h1>
-      <p>The page shows only the newest received image. Stored files are capped at six and rotated automatically.</p>
+      <p>The page shows the newest received image and the X-Road metadata that reached this provider application.</p>
     </header>
     <section class="frame">
       <div class="image-shell">
@@ -134,8 +135,24 @@ HTML_TEMPLATE = """<!doctype html>
           <span class="value" id="filename">-</span>
         </div>
         <div class="card">
+          <span class="label">Sent At</span>
+          <span class="value" id="sent-at">-</span>
+        </div>
+        <div class="card">
           <span class="label">Received At</span>
           <span class="value" id="received-at">-</span>
+        </div>
+        <div class="card">
+          <span class="label">X-Road Client</span>
+          <span class="value" id="xroad-client">-</span>
+        </div>
+        <div class="card">
+          <span class="label">X-Road Service</span>
+          <span class="value" id="xroad-service">-</span>
+        </div>
+        <div class="card">
+          <span class="label">Request ID</span>
+          <span class="value" id="xroad-request-id">-</span>
         </div>
         <div class="card">
           <span class="label">Status</span>
@@ -148,6 +165,10 @@ HTML_TEMPLATE = """<!doctype html>
     const pollIntervalMs = {{ poll_interval_ms }};
     let lastImagePath = null;
 
+    function getDisplayValue(value) {
+      return value && String(value).trim() ? value : "-";
+    }
+
     async function refreshLatestImage() {
       const response = await fetch("/api/latest", { cache: "no-store" });
       const data = await response.json();
@@ -155,14 +176,22 @@ HTML_TEMPLATE = """<!doctype html>
       const image = document.getElementById("latest-image");
       const emptyState = document.getElementById("empty-state");
       const filename = document.getElementById("filename");
+      const sentAt = document.getElementById("sent-at");
       const receivedAt = document.getElementById("received-at");
+      const xroadClient = document.getElementById("xroad-client");
+      const xroadService = document.getElementById("xroad-service");
+      const xroadRequestId = document.getElementById("xroad-request-id");
       const status = document.getElementById("status");
 
       if (!data.latest_image) {
         image.style.display = "none";
         emptyState.style.display = "block";
         filename.textContent = "-";
+        sentAt.textContent = "-";
         receivedAt.textContent = "-";
+        xroadClient.textContent = "-";
+        xroadService.textContent = "-";
+        xroadRequestId.textContent = "-";
         status.textContent = "Waiting for data";
         lastImagePath = null;
         return;
@@ -175,9 +204,17 @@ HTML_TEMPLATE = """<!doctype html>
 
       image.style.display = "block";
       emptyState.style.display = "none";
-      filename.textContent = data.latest_image.original_filename;
-      receivedAt.textContent = data.latest_image.received_at;
-      status.textContent = "Last receive completed successfully";
+      filename.textContent = getDisplayValue(data.latest_image.original_filename);
+      sentAt.textContent = getDisplayValue(data.latest_image.sent_at);
+      receivedAt.textContent = getDisplayValue(data.latest_image.received_at);
+      xroadClient.textContent = getDisplayValue(data.latest_image.xroad?.client_id);
+      xroadService.textContent = getDisplayValue(data.latest_image.xroad?.service_id);
+      xroadRequestId.textContent = getDisplayValue(
+        data.latest_image.xroad?.request_id || data.latest_image.xroad?.message_id
+      );
+      status.textContent = data.latest_image.xroad?.service_id
+        ? "Last receive completed through X-Road"
+        : "Last receive completed without X-Road headers";
     }
 
     refreshLatestImage().catch(console.error);
@@ -197,6 +234,7 @@ class ReceiverConfig:
     received_dir: Path
     max_stored_images: int
     ui_poll_interval_sec: int
+    openapi_server_url: str
 
 
 def load_config() -> ReceiverConfig:
@@ -215,6 +253,7 @@ def load_config() -> ReceiverConfig:
         received_dir=received_dir,
         max_stored_images=max_stored_images,
         ui_poll_interval_sec=ui_poll_interval_sec,
+        openapi_server_url=os.getenv("OPENAPI_SERVER_URL", "").strip().rstrip("/"),
     )
 
 
@@ -225,11 +264,15 @@ class ImageStore:
         self.lock = threading.Lock()
         self.received_dir.mkdir(parents=True, exist_ok=True)
 
-    def latest_image(self) -> Optional[Dict[str, str]]:
+    def latest_image(self) -> Optional[Dict[str, Any]]:
         with self.lock:
             return self._latest_image_unlocked()
 
-    def save_image(self, payload: Dict[str, str]) -> Dict[str, str]:
+    def save_image(
+        self,
+        payload: Dict[str, str],
+        xroad_metadata: Dict[str, str],
+    ) -> Dict[str, Any]:
         raw_bytes = self._decode_image(payload["image_base64"])
         extension = self._resolve_extension(payload["filename"], payload["content_type"], raw_bytes)
         safe_original_name = Path(payload["filename"]).name
@@ -239,10 +282,27 @@ class ImageStore:
         )
         stored_name = Path(stored_name).with_suffix(extension).name
         target_path = self.received_dir / stored_name
+        received_at = datetime.now(timezone.utc).isoformat()
+        metadata = {
+            "stored_filename": target_path.name,
+            "original_filename": safe_original_name,
+            "received_at": received_at,
+            "sent_at": payload.get("sent_at", ""),
+            "image_id": payload.get("image_id", ""),
+            "content_type": payload.get("content_type", ""),
+            "xroad": xroad_metadata,
+        }
 
         with self.lock:
             target_path.write_bytes(raw_bytes)
-            logging.info("Stored image path=%s received_at=%s", target_path, datetime.now(timezone.utc).isoformat())
+            self._write_metadata(target_path, metadata)
+            logging.info(
+                "Stored image path=%s received_at=%s xroad_client=%s xroad_service=%s",
+                target_path,
+                received_at,
+                xroad_metadata.get("client_id", "-"),
+                xroad_metadata.get("service_id", "-"),
+            )
             self._prune_old_images()
             latest = self._latest_image_unlocked()
 
@@ -273,27 +333,53 @@ class ImageStore:
             return ".png"
         raise ValueError("Unsupported image type. Only JPEG and PNG are allowed.")
 
+    def _metadata_path(self, image_path: Path) -> Path:
+        return image_path.with_suffix(f"{image_path.suffix}.json")
+
+    def _write_metadata(self, image_path: Path, metadata: Dict[str, Any]) -> None:
+        self._metadata_path(image_path).write_text(
+            json.dumps(metadata, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_metadata(self, image_path: Path) -> Dict[str, Any]:
+        metadata_path = self._metadata_path(image_path)
+        if not metadata_path.exists():
+            return {}
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            logging.warning("Failed to read metadata sidecar path=%s", metadata_path)
+            return {}
+
     def _prune_old_images(self) -> None:
         images = self._list_images()
         while len(images) > self.max_stored_images:
             oldest = images.pop(0)
             oldest.unlink(missing_ok=True)
+            self._metadata_path(oldest).unlink(missing_ok=True)
             logging.info("Deleted old image path=%s", oldest)
 
-    def _latest_image_unlocked(self) -> Optional[Dict[str, str]]:
+    def _latest_image_unlocked(self) -> Optional[Dict[str, Any]]:
         images = self._list_images()
         if not images:
             return None
 
         latest_path = images[-1]
-        received_at = datetime.fromtimestamp(
-            latest_path.stat().st_mtime, tz=timezone.utc
+        metadata = self._load_metadata(latest_path)
+        received_at = metadata.get("received_at") or datetime.fromtimestamp(
+            latest_path.stat().st_mtime,
+            tz=timezone.utc,
         ).isoformat()
-        original_filename = self._extract_original_filename(latest_path.name)
+        original_filename = metadata.get("original_filename") or self._extract_original_filename(latest_path.name)
         return {
             "stored_filename": latest_path.name,
             "original_filename": original_filename,
             "received_at": received_at,
+            "sent_at": metadata.get("sent_at", ""),
+            "image_id": metadata.get("image_id", ""),
+            "content_type": metadata.get("content_type", ""),
+            "xroad": metadata.get("xroad", {}),
             "url": f"/images/{latest_path.name}",
         }
 
@@ -326,6 +412,167 @@ def validate_payload(payload: Dict[str, str]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def extract_xroad_metadata(headers: Any) -> Dict[str, str]:
+    metadata = {
+        "client_id": headers.get("X-Road-Client", "").strip(),
+        "service_id": headers.get("X-Road-Service", "").strip(),
+        "request_id": headers.get("X-Road-Request-Id", "").strip(),
+        "message_id": headers.get("X-Road-Id", "").strip(),
+        "user_id": headers.get("X-Road-UserId", "").strip(),
+        "issue": headers.get("X-Road-Issue", "").strip(),
+        "security_server": headers.get("X-Road-Security-Server", "").strip(),
+        "represented_party": headers.get("X-Road-Represented-Party", "").strip(),
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def build_openapi_spec(base_url: str) -> Dict[str, Any]:
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "X-Road Image Receiver API",
+            "version": "1.0.0",
+            "description": (
+                "REST endpoints for receiving image payloads behind an X-Road "
+                "Security Server and inspecting the latest received image."
+            ),
+        },
+        "servers": [{"url": base_url}],
+        "paths": {
+            "/api/images": {
+                "post": {
+                    "summary": "Receive an image payload",
+                    "operationId": "receiveImage",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ImagePayload"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Image received successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ImageReceiveResponse"}
+                                }
+                            },
+                        },
+                        "400": {"description": "Invalid request"},
+                        "500": {"description": "Unexpected server error"},
+                    },
+                }
+            },
+            "/api/latest": {
+                "get": {
+                    "summary": "Get the latest received image metadata",
+                    "operationId": "getLatestImage",
+                    "responses": {
+                        "200": {
+                            "description": "Latest image metadata",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/LatestImageResponse"}
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/api/health": {
+                "get": {
+                    "summary": "Health check",
+                    "operationId": "healthCheck",
+                    "responses": {
+                        "200": {
+                            "description": "Receiver health information",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "latest_image_available": {"type": "boolean"},
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        },
+        "components": {
+            "schemas": {
+                "ImagePayload": {
+                    "type": "object",
+                    "required": [
+                        "image_id",
+                        "filename",
+                        "content_type",
+                        "sent_at",
+                        "image_base64",
+                    ],
+                    "properties": {
+                        "image_id": {"type": "string", "format": "uuid"},
+                        "filename": {"type": "string"},
+                        "content_type": {"type": "string"},
+                        "sent_at": {"type": "string", "format": "date-time"},
+                        "image_base64": {"type": "string"},
+                    },
+                },
+                "XRoadMetadata": {
+                    "type": "object",
+                    "properties": {
+                        "client_id": {"type": "string"},
+                        "service_id": {"type": "string"},
+                        "request_id": {"type": "string"},
+                        "message_id": {"type": "string"},
+                        "user_id": {"type": "string"},
+                        "issue": {"type": "string"},
+                        "security_server": {"type": "string"},
+                        "represented_party": {"type": "string"},
+                    },
+                },
+                "LatestImage": {
+                    "type": "object",
+                    "properties": {
+                        "stored_filename": {"type": "string"},
+                        "original_filename": {"type": "string"},
+                        "received_at": {"type": "string", "format": "date-time"},
+                        "sent_at": {"type": "string", "format": "date-time"},
+                        "image_id": {"type": "string", "format": "uuid"},
+                        "content_type": {"type": "string"},
+                        "url": {"type": "string"},
+                        "xroad": {"$ref": "#/components/schemas/XRoadMetadata"},
+                    },
+                },
+                "LatestImageResponse": {
+                    "type": "object",
+                    "properties": {
+                        "latest_image": {
+                            "oneOf": [
+                                {"$ref": "#/components/schemas/LatestImage"},
+                                {"type": "null"},
+                            ]
+                        }
+                    },
+                },
+                "ImageReceiveResponse": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "latest_image": {"$ref": "#/components/schemas/LatestImage"},
+                        "xroad": {"$ref": "#/components/schemas/XRoadMetadata"},
+                    },
+                },
+            }
+        },
+    }
+
+
 def create_app() -> Flask:
     config = load_config()
     image_store = ImageStore(
@@ -344,10 +591,25 @@ def create_app() -> Flask:
             poll_interval_ms=config.ui_poll_interval_sec * 1000,
         )
 
+    @app.get("/openapi.json")
+    def openapi_spec():
+        base_url = config.openapi_server_url or request.url_root.rstrip("/")
+        return jsonify(build_openapi_spec(base_url))
+
     @app.get("/api/latest")
     def latest():
         latest_image = image_store.latest_image()
         return jsonify({"latest_image": latest_image})
+
+    @app.get("/api/health")
+    def health():
+        latest_image = image_store.latest_image()
+        return jsonify(
+            {
+                "status": "ok",
+                "latest_image_available": latest_image is not None,
+            }
+        )
 
     @app.post("/api/images")
     def receive_image():
@@ -361,8 +623,19 @@ def create_app() -> Flask:
             logging.error("Payload validation failed: %s", error_message)
             return jsonify({"error": error_message}), 400
 
+        xroad_metadata = extract_xroad_metadata(request.headers)
+        if xroad_metadata:
+            logging.info(
+                "Received X-Road request client=%s service=%s request_id=%s",
+                xroad_metadata.get("client_id", "-"),
+                xroad_metadata.get("service_id", "-"),
+                xroad_metadata.get("request_id", "-"),
+            )
+        else:
+            logging.info("Received image request without X-Road headers.")
+
         try:
-            latest_image = image_store.save_image(payload)
+            latest_image = image_store.save_image(payload, xroad_metadata)
         except ValueError as exc:
             logging.error("Image decode/save failed: %s", exc)
             return jsonify({"error": str(exc)}), 400
@@ -374,6 +647,7 @@ def create_app() -> Flask:
             {
                 "message": "Image received successfully.",
                 "latest_image": latest_image,
+                "xroad": xroad_metadata,
             }
         ), 201
 
